@@ -1,108 +1,65 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { queryKeys } from '@/lib/queryKeys';
-import {
-	apiKeyService,
-	type ApiKey,
-	type CreateApiKeyInput,
-	type CreatedApiKey,
-} from '@/services/apiKey.service';
-import showToast from '@/utils/toast.util';
+import { useState, useEffect, useCallback } from 'react';
 
-/**
- * Keys owned by the authenticated user, for the developer settings page (#1322).
- *
- * Also used by the GraphQL explorer key selector. Only key metadata is returned;
- * the secret is never stored in the query cache.
- */
-export function useApiKeys() {
-	return useQuery<ApiKey[]>({
-		queryKey: queryKeys.apiKeys.list(),
-		queryFn: () => apiKeyService.listApiKeys(),
-		retry: false,
-	});
+export interface SavedQuery {
+  id: string;
+  name: string;
+  query: string;
+  variables: string;
+  updatedAt: number;
 }
 
-/**
- * Returns only active (non-revoked) keys for selection in the GraphQL explorer.
- */
-export function useActiveApiKeys() {
-	const query = useApiKeys();
-	return {
-		...query,
-		data: query.data?.filter(key => key.status !== 'revoked'),
-	};
-}
+const STORAGE_KEY = 'accesslayer_graphql_saved_queries';
 
-/**
- * Creates a key and hands the one-time secret straight to `onSecretCreated`.
- *
- * The secret deliberately never becomes mutation data or query-cache data:
- * only the key metadata is written to the cache, so nothing can replay the
- * secret from React Query or browser storage later.
- */
-export function useCreateApiKey(
-	onSecretCreated: (created: CreatedApiKey) => void
-) {
-	const queryClient = useQueryClient();
-	const queryKey = queryKeys.apiKeys.list();
+export function useSavedQueries() {
+  const [queries, setQueries] = useState<SavedQuery[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
 
-	return useMutation({
-		mutationFn: async (input: CreateApiKeyInput) => {
-			const created = await apiKeyService.createApiKey(input);
-			onSecretCreated(created);
-			return created.apiKey;
-		},
-		onSuccess: apiKey => {
-			queryClient.setQueryData<ApiKey[]>(queryKey, previous =>
-				previous ? [apiKey, ...previous] : [apiKey]
-			);
-			showToast.success('API key created');
-		},
-		onError: () => {
-			showToast.error('Could not create the API key. Try again.');
-		},
-	});
-}
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(queries));
+    } catch (err) {
+      console.error('Failed to persist saved queries:', err);
+    }
+  }, [queries]);
 
-/**
- * Revokes a key and optimistically flags it as revoked so it leaves the active
- * list immediately. A failed request rolls the cached list back.
- */
-export function useRevokeApiKey() {
-	const queryClient = useQueryClient();
-	const queryKey = queryKeys.apiKeys.list();
+  const saveQuery = useCallback((name: string, query: string, variables: string): SavedQuery => {
+    const newEntry: SavedQuery = {
+      id: crypto.randomUUID(),
+      name: name.trim() || 'Untitled Query',
+      query,
+      variables,
+      updatedAt: Date.now(),
+    };
+    setQueries((prev) => [newEntry, ...prev]);
+    return newEntry;
+  }, []);
 
-	return useMutation({
-		mutationFn: (keyId: string) => apiKeyService.revokeApiKey(keyId),
-		onMutate: async (keyId: string) => {
-			await queryClient.cancelQueries({ queryKey });
-			const previous = queryClient.getQueryData<ApiKey[]>(queryKey);
+  const updateQuery = useCallback((id: string, updates: Partial<Omit<SavedQuery, 'id'>>) => {
+    setQueries((prev) =>
+      prev.map((q) => (q.id === id ? { ...q, ...updates, updatedAt: Date.now() } : q))
+    );
+  }, []);
 
-			queryClient.setQueryData<ApiKey[]>(queryKey, current =>
-				current?.map(key =>
-					key.id === keyId
-						? {
-								...key,
-								status: 'revoked' as const,
-								revokedAt: new Date().toISOString(),
-							}
-						: key
-				)
-			);
+  const renameQuery = useCallback((id: string, newName: string) => {
+    if (!newName.trim()) return;
+    updateQuery(id, { name: newName.trim() });
+  }, [updateQuery]);
 
-			return { previous };
-		},
-		onError: (_error, _keyId, context) => {
-			if (context?.previous) {
-				queryClient.setQueryData(queryKey, context.previous);
-			}
-			showToast.error('Could not revoke that API key. Try again.');
-		},
-		onSuccess: () => {
-			showToast.success('API key revoked');
-		},
-		onSettled: () => {
-			void queryClient.invalidateQueries({ queryKey });
-		},
-	});
+  const deleteQuery = useCallback((id: string) => {
+    setQueries((prev) => prev.filter((q) => q.id !== id));
+  }, []);
+
+  return {
+    queries,
+    saveQuery,
+    updateQuery,
+    renameQuery,
+    deleteQuery,
+  };
 }
